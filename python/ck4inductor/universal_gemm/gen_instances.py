@@ -3,8 +3,10 @@
 
 import logging
 import os
+import re
 import subprocess
-from dataclasses import replace
+
+from dataclasses import fields, replace
 from functools import lru_cache, partial
 from typing import List
 
@@ -24,12 +26,25 @@ def _ck_library_dir():
         return None
     return gemm_instances_path
 
+# https://github.com/ROCm/composable_kernel/blob/f0d49d14fc89b055906c28968414a9a0961a454c/include/ck/tensor_operation/gpu/device/impl/device_gemm_multiple_d_xdl_cshuffle_v3.hpp
+TEMPLATE_KEYS = [field.name for field in fields(CKGemmOperation)]
+# Those keys are not parsed from the template, but are used to instantiate the `CKGemmOperation` class
+# and need to be in the right order
+PARSING_TEMPLATE_KEYS = [k for k in TEMPLATE_KEYS if k not in ['ds_layouts', 'ds_element_dtypes']]
+# Default values for the template arguments
+DEFAULT_VALUES = {
+    'ds_layouts': tuple(),
+    'ds_element_dtypes': tuple(),
+    'block_gemm_pipeline_scheduler': 'BlockGemmPipelineScheduler::Intrawave',
+    'block_gemm_pipeline_version': 'BlockGemmPipelineVersion::v1',
+    'a_compute_dtype': None,
+    'b_compute_dtype': None,
+}
 
 def parse_instances(str_instances: List[str]) -> List[CKGemmOperation]:
     """
     Parse the lines containing Universal Gemm template instances into `CKGemmOperation` instances
     """
-
     def maybe_int(s):
         try:
             return int(s)
@@ -38,45 +53,27 @@ def parse_instances(str_instances: List[str]) -> List[CKGemmOperation]:
 
     op_instances = []
     for line in str_instances:
+        # Extract the template arguments part
         s_template_args = line.split("DeviceGemm_Xdl_CShuffleV3")[-1].strip("<>, ")
-        template_args = []
-        i_current = 0
-        while i_current < len(s_template_args):
-            if s_template_args[i_current] == " ":
-                # skip whitespace
-                i_current += 1
-                continue
-            elif s_template_args[i_current : i_current + 2] == "S<":
-                # parse template S<Index...>
-                i_next = s_template_args.find(">", i_current)
-                template_args.append(
-                    tuple(map(int, s_template_args[i_current + 2 : i_next].split(",")))
-                )
-                i_current = i_next + 2
+        # Use a regular expression to split by commas, but not within S<...>
+        args_list = re.split(r',(?![^<]*>)', s_template_args)
+        args_list = [arg.strip() for arg in args_list]
+        # To make parsing work, we need to insert empty tuples for ds
+        # Create a dictionary with default values
+        template_args = {key: DEFAULT_VALUES.get(key, None) for key in TEMPLATE_KEYS}
+        # Populate the dictionary with parsed values
+        for key, arg in zip(PARSING_TEMPLATE_KEYS, args_list):
+            if 'S<' in arg:
+                template_args[key] = tuple(map(int, arg.strip('S<>').split(',')))
             else:
-                # all string attributes must be either type aliases or global constants in C++
-                i_next = s_template_args.find(",", i_current)
-                template_args.append(
-                    maybe_int(
-                        s_template_args[i_current : i_next if i_next != -1 else None]
-                    )
-                )
-                if i_next != -1:
-                    i_current = i_next + 1
-            if i_next == -1:
-                break
-
-        template_args.insert(2, tuple())  # ds layout
-        template_args.insert(6, tuple())  # ds dtype
+                template_args[key] = maybe_int(arg.strip())
         try:
-            new_instance = CKGemmOperation(
-                *template_args,  # type: ignore[arg-type]
-            )
-            op_instances.append(new_instance)
+            new_instance = CKGemmOperation(**template_args)
         except TypeError as e:
-            log.debug(f"{e} when parsing {line}")
+            log.error(f"Failed to parse instance {line}: {e}. Ignoring ...")
+            continue
+        op_instances.append(new_instance)
     return op_instances
-
 
 def default_instances() -> List[CKGemmOperation]:
     # fallback: known working op instance for problem size M=2240 K=256 N=2048
